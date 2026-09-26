@@ -234,8 +234,158 @@ function healConversationsFromMessages() {
   }
 }
 
-// Initial healing of conversations
+// Global alias map to map any legacy/variant conversation IDs to the canonical ID
+const convAliasMap = new Map();
+
+function resolveCanonicalConvId(id) {
+  if (!id) return id;
+  return convAliasMap.get(id) || id;
+}
+
+// Auto-consolidate and deduplicate direct conversations between the same two users
+function canonicalizeAndDeduplicateConversations() {
+  try {
+    healConversationsFromMessages();
+
+    const allConvs = db.conversations.find();
+    if (!allConvs || allConvs.length === 0) return;
+
+    const directGroups = new Map();
+
+    allConvs.forEach((conv) => {
+      if (conv.type !== 'direct') return;
+
+      const userMap = new Map();
+      const allKeys = new Set(conv.participants || []);
+      if (conv.members) {
+        Object.keys(conv.members).forEach((k) => {
+          allKeys.add(k);
+          if (conv.members[k]?.userId) allKeys.add(conv.members[k].userId);
+          if (conv.members[k]?.username) allKeys.add(conv.members[k].username);
+        });
+      }
+      if (conv.id && conv.id.startsWith('direct_')) {
+        const parts = conv.id.substring('direct_'.length).split('_');
+        parts.forEach((p) => { if (p) allKeys.add(p); });
+      }
+
+      allKeys.forEach((key) => {
+        const u = resolveUser(key);
+        if (u && u.username) {
+          userMap.set(u.username.toLowerCase(), u);
+        }
+      });
+
+      const resolvedUsers = Array.from(userMap.values());
+      if (resolvedUsers.length === 2) {
+        const sortedUsernames = [resolvedUsers[0].username.toLowerCase(), resolvedUsers[1].username.toLowerCase()].sort();
+        const pairKey = sortedUsernames.join('_');
+        if (!directGroups.has(pairKey)) {
+          directGroups.set(pairKey, []);
+        }
+        directGroups.get(pairKey).push({ conv, resolvedUsers, canonicalId: `direct_${pairKey}` });
+      }
+    });
+
+    let dbModified = false;
+
+    directGroups.forEach((entries, pairKey) => {
+      const canonicalId = `direct_${pairKey}`;
+      const [userA, userB] = entries[0].resolvedUsers;
+
+      let primaryEntry = entries.find((e) => e.conv.id === canonicalId) || entries[0];
+      const primaryConv = primaryEntry.conv;
+
+      const mergedParticipants = new Set(primaryConv.participants || []);
+      const mergedMembers = { ...(primaryConv.members || {}) };
+
+      [userA, userB].forEach((u) => {
+        if (u.id) mergedParticipants.add(u.id);
+        if (u.firebaseUid) mergedParticipants.add(u.firebaseUid);
+        if (u.username) mergedParticipants.add(u.username);
+        if (u.email) mergedParticipants.add(u.email);
+
+        mergedMembers[u.id] = {
+          userId: u.id,
+          username: u.username,
+          displayName: u.displayName || u.username,
+          avatarUrl: u.avatarUrl || '',
+        };
+        mergedMembers[u.username] = {
+          userId: u.id,
+          username: u.username,
+          displayName: u.displayName || u.username,
+          avatarUrl: u.avatarUrl || '',
+        };
+      });
+
+      let latestMsg = primaryConv.lastMessage;
+      let latestUpdated = primaryConv.updatedAt || primaryConv.createdAt || 0;
+
+      entries.forEach((e) => {
+        const c = e.conv;
+        if (c.id !== canonicalId) {
+          convAliasMap.set(c.id, canonicalId);
+        }
+
+        (c.participants || []).forEach((p) => mergedParticipants.add(p));
+        if (c.members) {
+          Object.assign(mergedMembers, c.members);
+        }
+
+        if (c.lastMessage && (!latestMsg || (c.lastMessage.timestamp || 0) > (latestMsg.timestamp || 0))) {
+          latestMsg = c.lastMessage;
+        }
+        if ((c.updatedAt || 0) > latestUpdated) {
+          latestUpdated = c.updatedAt;
+        }
+
+        if (c.id !== primaryConv.id) {
+          db.conversations.delete(c.id);
+          dbModified = true;
+        }
+      });
+
+      // Update all messages in db.messages that had any of the old conversation IDs
+      const allOldIds = entries.map((e) => e.conv.id);
+      allOldIds.forEach((oldId) => {
+        if (oldId !== canonicalId) {
+          const msgsToMigrate = db.messages.find((m) => m.conversationId === oldId);
+          if (msgsToMigrate && msgsToMigrate.length > 0) {
+            msgsToMigrate.forEach((m) => {
+              m.conversationId = canonicalId;
+            });
+            dbModified = true;
+          }
+        }
+      });
+
+      if (primaryConv.id !== canonicalId) {
+        db.conversations.delete(primaryConv.id);
+        primaryConv.id = canonicalId;
+      }
+      primaryConv.participants = Array.from(mergedParticipants);
+      primaryConv.members = mergedMembers;
+      primaryConv.lastMessage = latestMsg;
+      primaryConv.updatedAt = latestUpdated;
+
+      db.conversations.upsert(canonicalId, primaryConv);
+      dbModified = true;
+    });
+
+    if (dbModified) {
+      db.conversations.save();
+      db.messages.save();
+      console.log(`[Deduplication] Successfully consolidated conversations and migrated messages.`);
+    }
+  } catch (err) {
+    console.error('[Deduplication Error]:', err);
+  }
+}
+
+// Initial healing & deduplication of conversations
 healConversationsFromMessages();
+canonicalizeAndDeduplicateConversations();
 
 // Sync existing users into dedicated user directories
 try {
@@ -586,8 +736,8 @@ app.get('/api/conversations', (req, res) => {
     return res.status(400).json({ error: 'userId query parameter is required' });
   }
 
-  // Ensure any orphaned messages have their conversations reconstructed
-  healConversationsFromMessages();
+  // Ensure any orphaned messages or duplicate direct conversations are healed & consolidated
+  canonicalizeAndDeduplicateConversations();
 
   const user = resolveUser(userId);
   const userKeys = new Set([userId, String(userId).toLowerCase()]);
@@ -638,18 +788,36 @@ app.post('/api/conversations/direct', (req, res) => {
     avatarUrl: targetUser.avatarUrl || '',
   };
 
-  const sortedUsernames = [sender.username, receiver.username].sort();
-  const convId = `direct_${sortedUsernames[0]}_${sortedUsernames[1]}`;
+  const sortedUsernames = [
+    String(sender.username || sender.id).toLowerCase(),
+    String(receiver.username || receiver.id).toLowerCase(),
+  ].sort();
+  const canonicalId = `direct_${sortedUsernames[0]}_${sortedUsernames[1]}`;
 
-  let conv = db.conversations.findById(convId);
+  // Check if conversation already exists by canonicalId or between these users
+  let conv = db.conversations.findById(canonicalId);
+  if (!conv) {
+    conv = db.conversations.findOne((c) => {
+      if (c.type !== 'direct') return false;
+      const pList = (c.participants || []).map((p) => String(p).toLowerCase());
+      const hasSender = pList.includes(String(sender.id).toLowerCase()) || pList.includes(String(sender.username).toLowerCase());
+      const hasReceiver = pList.includes(String(receiver.id).toLowerCase()) || pList.includes(String(receiver.username).toLowerCase());
+      return hasSender && hasReceiver;
+    });
+  }
+
+  const allParticipantIds = new Set([
+    sender.id, receiver.id, sender.username, receiver.username,
+    sender.email, receiver.email, sender.firebaseUid, receiver.firebaseUid
+  ].filter(Boolean));
 
   if (!conv) {
     conv = db.conversations.insert({
-      id: convId,
+      id: canonicalId,
       type: 'direct',
       name: receiver.displayName,
       avatarUrl: receiver.avatarUrl,
-      participants: [sender.id, receiver.id, sender.username, receiver.username],
+      participants: Array.from(allParticipantIds),
       members: {
         [sender.id]: {
           userId: sender.id,
@@ -663,19 +831,32 @@ app.post('/api/conversations/direct', (req, res) => {
           displayName: receiver.displayName,
           avatarUrl: receiver.avatarUrl,
         },
+        [sender.username]: {
+          userId: sender.id,
+          username: sender.username,
+          displayName: sender.displayName,
+          avatarUrl: sender.avatarUrl,
+        },
+        [receiver.username]: {
+          userId: receiver.id,
+          username: receiver.username,
+          displayName: receiver.displayName,
+          avatarUrl: receiver.avatarUrl,
+        },
       },
       unreadCount: 0,
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });
   } else {
-    conv.members[receiver.id] = {
-      userId: receiver.id,
-      username: receiver.username,
-      displayName: receiver.displayName,
-      avatarUrl: receiver.avatarUrl,
-    };
-    db.conversations.update(convId, { members: conv.members });
+    (conv.participants || []).forEach((p) => allParticipantIds.add(p));
+    conv.participants = Array.from(allParticipantIds);
+    if (!conv.members) conv.members = {};
+    conv.members[sender.id] = { userId: sender.id, username: sender.username, displayName: sender.displayName, avatarUrl: sender.avatarUrl };
+    conv.members[receiver.id] = { userId: receiver.id, username: receiver.username, displayName: receiver.displayName, avatarUrl: receiver.avatarUrl };
+    conv.members[sender.username] = { userId: sender.id, username: sender.username, displayName: sender.displayName, avatarUrl: sender.avatarUrl };
+    conv.members[receiver.username] = { userId: receiver.id, username: receiver.username, displayName: receiver.displayName, avatarUrl: receiver.avatarUrl };
+    db.conversations.update(conv.id, { participants: conv.participants, members: conv.members });
   }
 
   res.json({ conversation: conv });
@@ -823,23 +1004,46 @@ app.delete('/api/conversations/:id/participants/:userId', (req, res) => {
 
 // 6. Messages Management
 app.get('/api/conversations/:id/messages', (req, res) => {
-  const { id } = req.params;
+  const rawId = req.params.id;
+  const canonicalId = resolveCanonicalConvId(rawId);
   const limit = parseInt(req.query.limit) || 100;
   const before = parseInt(req.query.before) || Infinity;
 
+  // Search messages matching rawId OR canonicalId OR any aliases
+  const matchedIds = new Set([rawId, canonicalId]);
+  convAliasMap.forEach((target, source) => {
+    if (target === canonicalId || target === rawId) {
+      matchedIds.add(source);
+    }
+  });
+
+  const idsArray = Array.from(matchedIds);
   let messages = db.messages
-    .find((m) => m.conversationId === id && (m.timestamp || 0) < before)
+    .find((m) => idsArray.includes(m.conversationId) && (m.timestamp || 0) < before)
     .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
 
-  if (messages.length > limit) {
-    messages = messages.slice(-limit);
+  // Deduplicate messages by id
+  const uniqueMsgs = [];
+  const seenMsgIds = new Set();
+  messages.forEach((m) => {
+    if (!seenMsgIds.has(m.id)) {
+      seenMsgIds.add(m.id);
+      uniqueMsgs.push(m);
+    }
+  });
+
+  if (uniqueMsgs.length > limit) {
+    messages = uniqueMsgs.slice(-limit);
+  } else {
+    messages = uniqueMsgs;
   }
 
   res.json({ messages });
 });
 
 app.post('/api/conversations/:id/messages', (req, res) => {
-  const { id } = req.params;
+  const rawId = req.params.id;
+  const id = resolveCanonicalConvId(rawId);
   const messageData = req.body;
 
   const msgId = messageData.id || `msg_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
@@ -857,12 +1061,15 @@ app.post('/api/conversations/:id/messages', (req, res) => {
 
   // 2. Update or insert conversation summary
   let conv = db.conversations.findById(id);
+  if (!conv && rawId !== id) {
+    conv = db.conversations.findById(rawId);
+  }
   if (conv) {
-    db.conversations.update(id, {
+    db.conversations.update(conv.id, {
       lastMessage: newMessage,
       updatedAt: newMessage.timestamp,
     });
-    conv = db.conversations.findById(id);
+    conv = db.conversations.findById(conv.id);
   } else {
     // Reconstruct/auto-create conversation so it is immediately visible in conversations list
     const participants = [newMessage.senderId];
@@ -902,6 +1109,9 @@ app.post('/api/conversations/:id/messages', (req, res) => {
 
   // 4. Real-time emit to conversation room and directly to user rooms
   io.to(`conv_${id}`).emit('message:new', { conversationId: id, message: newMessage });
+  if (rawId !== id) {
+    io.to(`conv_${rawId}`).emit('message:new', { conversationId: rawId, message: newMessage });
+  }
 
   if (conv && conv.participants) {
     conv.participants.forEach((pKey) => {
