@@ -113,16 +113,129 @@ const upload = multer({
 const userSockets = new Map();
 const socketToUser = new Map();
 
-// Helper to resolve user by ID, username, or email
+// Helper to resolve user by ID, username, email, or Firebase UID
 function resolveUser(identifier) {
   if (!identifier) return null;
   const idStr = String(identifier).toLowerCase().trim();
   return (
-    db.users.findOne((u) => u.id === identifier) ||
+    db.users.findOne((u) => u.id === identifier || u.firebaseUid === identifier || (u.userId && u.userId === identifier)) ||
     db.users.findOne((u) => (u.username || '').toLowerCase() === idStr) ||
     db.users.findOne((u) => (u.email || '').toLowerCase() === idStr)
   );
 }
+
+// Auto-heal and reconstruct conversations from messages.json if missing from conversations.json
+function healConversationsFromMessages() {
+  try {
+    const allMessages = db.messages.find();
+    if (!allMessages || allMessages.length === 0) return;
+
+    const convMap = new Map();
+    allMessages.forEach((msg) => {
+      if (!msg.conversationId) return;
+      if (!convMap.has(msg.conversationId)) {
+        convMap.set(msg.conversationId, []);
+      }
+      convMap.get(msg.conversationId).push(msg);
+    });
+
+    convMap.forEach((msgs, convId) => {
+      msgs.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+      const firstMsg = msgs[0];
+      const lastMsg = msgs[msgs.length - 1];
+
+      let conv = db.conversations.findById(convId);
+      if (!conv) {
+        const participantsSet = new Set();
+        const members = {};
+
+        msgs.forEach((m) => {
+          if (m.senderId) {
+            participantsSet.add(m.senderId);
+            const u = resolveUser(m.senderId);
+            if (u) {
+              if (u.id) participantsSet.add(u.id);
+              if (u.firebaseUid) participantsSet.add(u.firebaseUid);
+              if (u.username) participantsSet.add(u.username);
+              if (u.email) participantsSet.add(u.email);
+            }
+            members[m.senderId] = {
+              userId: m.senderId,
+              username: u?.username || m.senderId,
+              displayName: m.senderName || u?.displayName || 'User',
+              avatarUrl: m.senderAvatar || u?.avatarUrl || '',
+            };
+          }
+        });
+
+        if (convId.startsWith('direct_')) {
+          const parts = convId.replace(/^direct_/, '').split('_');
+          parts.forEach((p) => {
+            if (p) {
+              participantsSet.add(p);
+              const u = resolveUser(p);
+              if (u) {
+                if (u.id) participantsSet.add(u.id);
+                if (u.firebaseUid) participantsSet.add(u.firebaseUid);
+                if (u.username) participantsSet.add(u.username);
+                if (u.email) participantsSet.add(u.email);
+                if (!members[p]) {
+                  members[p] = {
+                    userId: u.id,
+                    username: u.username,
+                    displayName: u.displayName,
+                    avatarUrl: u.avatarUrl,
+                  };
+                }
+              }
+            }
+          });
+        }
+
+        db.conversations.insert({
+          id: convId,
+          type: convId.startsWith('group_') ? 'group' : 'direct',
+          name: lastMsg.senderName || 'Conversation',
+          avatarUrl: lastMsg.senderAvatar || '',
+          participants: Array.from(participantsSet),
+          members,
+          unreadCount: 0,
+          lastMessage: lastMsg,
+          createdAt: firstMsg.timestamp || Date.now(),
+          updatedAt: lastMsg.timestamp || Date.now(),
+        });
+        console.log(`[Auto-Heal] Successfully reconstructed conversation: ${convId} with ${msgs.length} messages`);
+      } else {
+        // Ensure participants and lastMessage are current
+        const updates = {};
+        if (!conv.lastMessage || (lastMsg.timestamp || 0) >= (conv.lastMessage.timestamp || 0)) {
+          updates.lastMessage = lastMsg;
+          updates.updatedAt = lastMsg.timestamp || conv.updatedAt || Date.now();
+        }
+        const pSet = new Set(conv.participants || []);
+        msgs.forEach((m) => {
+          if (m.senderId) {
+            pSet.add(m.senderId);
+            const u = resolveUser(m.senderId);
+            if (u) {
+              if (u.id) pSet.add(u.id);
+              if (u.firebaseUid) pSet.add(u.firebaseUid);
+              if (u.username) pSet.add(u.username);
+              if (u.email) pSet.add(u.email);
+            }
+          }
+        });
+        updates.participants = Array.from(pSet);
+        db.conversations.update(convId, updates);
+      }
+    });
+  } catch (err) {
+    console.warn('[Auto-Heal Notice]:', err.message);
+  }
+}
+
+// Initial healing of conversations
+healConversationsFromMessages();
 
 // Sync existing users into dedicated user directories
 try {
@@ -426,14 +539,33 @@ app.get('/api/conversations', (req, res) => {
     return res.status(400).json({ error: 'userId query parameter is required' });
   }
 
+  // Ensure any orphaned messages have their conversations reconstructed
+  healConversationsFromMessages();
+
   const user = resolveUser(userId);
-  const userKeys = [userId];
+  const userKeys = new Set([userId, String(userId).toLowerCase()]);
   if (user) {
-    userKeys.push(user.id, user.username, user.email);
+    if (user.id) userKeys.add(user.id);
+    if (user.firebaseUid) userKeys.add(user.firebaseUid);
+    if (user.username) {
+      userKeys.add(user.username);
+      userKeys.add(user.username.toLowerCase());
+    }
+    if (user.email) {
+      userKeys.add(user.email);
+      userKeys.add(user.email.toLowerCase());
+    }
   }
 
+  const keysArray = Array.from(userKeys);
   const conversations = db.conversations
-    .find((c) => c.participants && c.participants.some((p) => userKeys.includes(p)))
+    .find((c) => {
+      if (!c.participants) return false;
+      return c.participants.some((p) => {
+        const pStr = String(p).toLowerCase();
+        return keysArray.includes(p) || keysArray.includes(pStr);
+      });
+    })
     .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
 
   res.json({ conversations });
@@ -676,13 +808,40 @@ app.post('/api/conversations/:id/messages', (req, res) => {
   // 1. Insert into global db.messages
   db.messages.insert(newMessage);
 
-  // 2. Update conversation summary
-  db.conversations.update(id, {
-    lastMessage: newMessage,
-    updatedAt: newMessage.timestamp,
-  });
-
-  const conv = db.conversations.findById(id);
+  // 2. Update or insert conversation summary
+  let conv = db.conversations.findById(id);
+  if (conv) {
+    db.conversations.update(id, {
+      lastMessage: newMessage,
+      updatedAt: newMessage.timestamp,
+    });
+    conv = db.conversations.findById(id);
+  } else {
+    // Reconstruct/auto-create conversation so it is immediately visible in conversations list
+    const participants = [newMessage.senderId];
+    if (id.startsWith('direct_')) {
+      const parts = id.replace(/^direct_/, '').split('_');
+      parts.forEach((p) => { if (p && !participants.includes(p)) participants.push(p); });
+    }
+    conv = db.conversations.insert({
+      id,
+      type: id.startsWith('group_') ? 'group' : 'direct',
+      name: newMessage.senderName || 'Chat',
+      avatarUrl: newMessage.senderAvatar || '',
+      participants,
+      members: {
+        [newMessage.senderId]: {
+          userId: newMessage.senderId,
+          displayName: newMessage.senderName,
+          avatarUrl: newMessage.senderAvatar,
+        },
+      },
+      lastMessage: newMessage,
+      unreadCount: 0,
+      createdAt: newMessage.timestamp,
+      updatedAt: newMessage.timestamp,
+    });
+  }
 
   // 3. Persist to participants' dedicated user folders
   if (conv && conv.participants) {
