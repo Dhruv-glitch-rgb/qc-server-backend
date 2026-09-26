@@ -502,6 +502,53 @@ app.post('/api/users/:username/status', (req, res) => {
   res.json({ success: true, customStatus: statusText, moodEmoji });
 });
 
+// Status Stories (24h Ephemeral WhatsApp-Style Stories)
+let storiesList = [];
+
+app.get('/api/status', (req, res) => {
+  const now = Date.now();
+  // Filter active stories posted within 24 hours
+  storiesList = storiesList.filter((s) => now - (s.timestamp || 0) < 24 * 60 * 60 * 1000);
+  res.json({ stories: storiesList });
+});
+
+app.post('/api/status', rateLimiter(60), (req, res) => {
+  const { userId, username, displayName, userAvatar, text, mediaUrl, caption, backgroundColor } = req.body;
+  if (!username && !userId) return res.status(400).json({ error: 'User is required' });
+
+  const story = {
+    id: `story_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+    userId: userId || username,
+    username: username || userId,
+    userName: displayName || username || 'User',
+    userAvatar: userAvatar || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150',
+    mediaUrl: mediaUrl || '',
+    text: text || '',
+    caption: caption || text || '',
+    backgroundColor: backgroundColor || 'linear-gradient(135deg, #10b981, #059669)',
+    timestamp: Date.now(),
+    expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+    timeAgo: 'Just now',
+    viewed: false,
+  };
+
+  storiesList.unshift(story);
+  if (storiesList.length > 200) storiesList.pop();
+
+  io.emit('status:new', { story });
+  res.json({ story });
+});
+
+app.delete('/api/status/:id', (req, res) => {
+  const { id } = req.params;
+  const idx = storiesList.findIndex((s) => s.id === id);
+  if (idx !== -1) {
+    storiesList.splice(idx, 1);
+    io.emit('status:deleted', { id });
+  }
+  res.json({ success: true });
+});
+
 // Starred messages
 app.get('/api/users/:username/starred', (req, res) => {
   const { username } = req.params;
