@@ -138,6 +138,22 @@ try {
 // REST API ROUTES
 // ==========================================
 
+// 0. Root Endpoint
+app.get('/', (req, res) => {
+  res.json({
+    status: 'online',
+    service: 'QuantumConnect Dedicated Server Backend',
+    version: '2.1.0',
+    message: 'QuantumConnect 24/7 Cloud Backend is operational',
+    endpoints: {
+      health: '/api/health',
+      stats: '/api/stats',
+      users: '/api/users',
+      conversations: '/api/conversations',
+    },
+  });
+});
+
 // 1. Health & Server Metrics
 app.get('/api/health', (req, res) => {
   res.json({
